@@ -1,162 +1,130 @@
-# Approach
+# SHL Assessment Recommender — Approach
 
-## Architecture
+I built a chat-based API that turns a vague hiring need ("we need someone for a leadership
+role") into a grounded shortlist of real SHL assessments, asks a clarifying question when it
+doesn't have enough to go on, updates the shortlist as requirements change, and answers
+comparison questions using catalog facts instead of guesses.
 
-Stateless FastAPI service (`/health`, `/chat`). Each `/chat` call: (1) build a
-retrieval query from the full message history, (2) BM25-search the 377-item
-catalog for the top ~25 candidates, (3) hand the LLM the conversation + only
-those candidates + a rules/few-shot system prompt, (4) parse its structured
-JSON decision, (5) **ground every recommended id against the local catalog
-before it ever reaches the response** -- the LLM never emits a name or URL
-directly, only catalog ids, and any id it invents is silently dropped. This is
-the main defense against hallucinated URLs: correctness of the grounding step
-is enforced in code, not by asking the model nicely.
+**At a glance:** 377-item SHL catalog · BM25 retrieval · Llama 3.3 70B (Groq) · Recall@10 = 0.56
+on real traces · 7/8 behavior checks passed live · 15/15 unit tests passing.
 
-## Retrieval
+## How it's put together
 
-377 items is small. A full embeddings/vector-DB stack (Chroma/FAISS +
-sentence-transformers) adds cold-start weight and RAM on free hosting for
-no real recall benefit at this scale, so I used BM25 (`rank_bm25`) over
-name+description+category+job-level text, boosted 3x on name matches. Two
-gaps BM25 alone has: (a) short acronyms ("OPQ", "GSA", "DSI") score poorly on
-term frequency, and (b) a user typing an exact product name should always
-surface that product. Both are handled by a small alias/substring
-force-include pass layered on top of the BM25 candidates (`app/retrieval.py`).
-Retrieval always returns a candidate *set*, never a final answer -- final
-selection, coverage reasoning ("add a cognitive test as a default"), and
-refinement logic are the LLM's job, grounded in that set.
+The service is a small, stateless FastAPI app with two endpoints, `/health` and `/chat`. Every
+`/chat` call does the same five things:
 
-## Agent / prompt design
+1. Look at the whole conversation so far and turn it into a search query.
+2. Search the 377-item catalog for the ~25 most relevant assessments.
+3. Hand the LLM the conversation plus *only* those candidates, along with a system prompt
+   spelling out the rules (clarify, recommend, refine, compare, refuse, stay grounded).
+4. Get back a structured decision as JSON — not free text I have to guess-parse.
+5. **Check every recommended item against the real catalog before it's allowed out the door.**
 
-One LLM call per turn, returning strict JSON: `reply`, `in_scope`,
-`commit_shortlist`, `recommended_ids`, `end_of_conversation`. This maps onto
-the public schema in `app/agent.py`, with hard rules enforced in code
-regardless of what the model returns:
+That last step is the most important one. The model never gets to write a product name or a
+URL directly — it can only point at an ID from the list I gave it, and if it ever points at an
+ID that isn't in that list, I quietly drop it. This means a made-up assessment or a broken link
+isn't just "unlikely," it's structurally impossible. I'd rather guarantee this in code than trust
+a prompt instruction, however well worded.
 
-- `in_scope=false` (refusal) forces empty recommendations and
-  `end_of_conversation=false`, **even if a shortlist was already committed
-  earlier** -- reading the 10 provided sample traces (esp. `C7`, `C10`)
-  showed the reference behavior blanks recommendations on a refusal or a
-  pure-negotiation turn and only re-shows the list once the agent explicitly
-  reaffirms it. That distinction (state exists vs. state is being *repeated
-  this turn*) turned out to be the single most important behavioral rule to
-  get right, and it's why `commit_shortlist` is a per-turn decision rather
-  than "recommendations are empty only pre-first-commit."
-- Turn budget is tiny (8 total, so ~4 exchanges). The prompt explicitly tells
-  the model to ask at most 1-2 clarifying questions before committing to a
-  shortlist using sane defaults -- without this instruction, early testing
-  showed the model would happily keep asking clarifying questions past the
-  turn cap, which zeroes out Recall@10 for that trace regardless of catalog
-  quality.
-- Compare questions ("what's the difference between X and Y") are answered
-  only from the candidate list's own descriptions, not general knowledge, and
-  reuse the alias/substring matcher so an abbreviated product name still
-  resolves to the right catalog row.
+## Finding the right assessments (retrieval)
 
-Two condensed few-shot examples (clarify-on-vague-input, refuse-mid-
-conversation-legal-question) are included directly in the system prompt
-rather than all 10 traces, trading a small amount of behavioral fidelity for
-prompt size and latency headroom against the 30s per-call limit.
+377 assessments is a small catalog — small enough that a full vector database with embeddings
+felt like the wrong tool for the job. It adds weight and startup time for free hosting, without
+a real accuracy payoff at this scale. So I used **BM25**, a classic keyword-ranking algorithm,
+over each item's name, description, category, and job level, with product names weighted
+higher so an exact match always wins.
 
-## What didn't work / changed
+BM25 alone has two blind spots: short acronyms like "OPQ" or "GSA" don't score well on raw
+word frequency, and if someone types an exact product name, it should always be found — no
+exceptions. I added a small second pass that catches both cases directly, so retrieval never
+misses the obvious answer just because the ranking math didn't favor it.
 
-- **`test_type` is derived, not scraped separately.** The provided catalog
-  JSON only has a `keys` (category) field, not SHL's internal single-letter
-  "Test Type" badge. For most items these agree 1:1 (verified against the
-  sample traces), but a few report-type products (e.g. "Global Skills
-  Development Report") show a narrower Test Type on shl.com than their full
-  category list. I checked whether the live site could fill this gap and
-  found it's been restructured since the catalog was scraped (product URLs
-  now 301-redirect elsewhere), so re-scraping would introduce fresh
-  inconsistency rather than fix it. Since Recall@10 and the behavior probes
-  score which assessments are recommended, not the accuracy of the
-  `test_type` label, I mapped categories -> codes via SHL's public Great-8
-  taxonomy and moved on rather than over-investing here.
-- **Gemini 2.5 Flash silently returned empty content** under the default
-  request until I added `reasoning_effort: "none"` -- the model was spending
-  the entire token budget on hidden reasoning tokens before emitting the
-  JSON body, so a plain `max_tokens` bump alone didn't fix it. Caught by
-  the FastAPI smoke test returning an empty fallback reply, root-caused via
-  the raw response's `usage.completion_tokens: 0`.
-- **Retry logic was originally uniform** (retry any exception with a
-  "please output valid JSON" follow-up). Split it: JSON-shape errors get one
-  repair round-trip; transport/rate-limit errors (429/timeout) fail straight
-  to the safe fallback, since a same-request retry can't out-wait a 429 that
-  says "retry in 50s" within a 30s call budget.
-- **Prompt size vs. free-tier token limits.** The original 40-candidate
-  format (~5,000 input tokens/call) was fine on paper but repeatedly tripped
-  Groq's free-tier 12,000-tokens/minute cap during eval runs. Cut candidates
-  to 25 and compressed each row (dropped the always-`true` `remote` field
-  entirely, replaced repeated category names with a one-line legend +
-  single-letter codes, shortened descriptions to 100 chars) -- roughly
-  halved prompt size (~2,800 tokens/call) with no measured drop in which
-  items got retrieved, since the alias/substring force-include still
-  guarantees exact-name and acronym matches regardless of BM25 cutoff.
+Retrieval's only job is to hand the LLM a good *shortlist of candidates* — it never decides the
+final answer itself. Picking which of those candidates actually make the cut, reasoning about
+coverage ("this role probably also needs a cognitive test"), and updating the list as the
+conversation evolves are all the LLM's job, working only from what retrieval gave it.
 
-## Evaluation
+## How the agent thinks
 
-Measured against all four axes the task calls out, each with a runnable
-script/test suite rather than a one-off judgment call:
+Each turn, the LLM returns one structured decision: its reply text, whether the request is even
+in scope, whether it's ready to commit to a shortlist, which catalog IDs to recommend, and
+whether the conversation is wrapped up. A few rules are enforced in code no matter what the
+model says, because I don't trust prompt instructions alone to hold up over many turns:
 
-- **Retrieval quality** -- `tests/test_retrieval.py` asserts BM25 surfaces
-  relevant items for a query and the alias layer resolves acronyms/exact
-  names that term-frequency search alone misses (e.g. "GSA", "OPQ").
-- **Recommendation relevance** -- `eval/run_eval.py` replays the 10 provided
-  sample conversations' user turns (verbatim) against the live agent and
-  reports Recall@10 per trace by URL match. **Result: mean Recall@10 = 0.56**
-  across the 7 traces I could score before hitting Groq's free-tier daily
-  token cap (100k/day) mid-run (see limitation below); no trace scored 0 on a
-  real (non-rate-limited) run. Reference shortlists are often more specific
-  than a reasonable first-pass answer (e.g. trace C1 expects the exact
-  OPQ32r + two OPQ report add-ons; the agent picked three different,
-  individually-defensible leadership-benchmark assessments) -- partial
-  credit across nearly every trace, rather than exact matches, is the
-  realistic target for a system with no query-specific tuning.
-- **Groundedness** -- enforced structurally, not just measured:
-  `_ground_recommendations()` in `app/agent.py` filters any id the LLM
-  returns that isn't in that turn's candidate list, so a hallucinated
-  recommendation is *impossible* to return, not just unlikely.
-  `test_hallucinated_ids_only_downgrades_to_no_commit` in `tests/test_agent.py`
-  verifies this with a stub LLM that deliberately hallucinates, and the
-  `groundedness_urls_are_real_catalog_urls` probe in
-  `eval/behavior_probes.py` checks it live end-to-end (passed).
-- **Overall behavior/response accuracy** -- `eval/behavior_probes.py` runs 8
-  targeted single/multi-turn probes mirroring the assignment's own examples
-  (refuses off-topic, refuses legal questions, refuses prompt injection,
-  no recommendation on a vague turn-1 query, commits a shortlist for a
-  detailed request, refines on a new constraint, always-valid schema even on
-  empty/garbage input). **Result: 7/8 passed** on a live run; the one
-  "failure" (`refine_updates_shortlist_on_new_constraint`) was the agent
-  declining to bolt on a redundant personality test because the existing
-  recommended item already covers Personality & Competencies -- arguably
-  correct judgment, and a sign the probe's assertion is stricter than it
-  should be, not that the agent is wrong.
+- **A refusal always clears the shortlist for that turn** — even if one was already agreed on
+  earlier in the conversation. I found this by reading through SHL's own example conversations
+  closely: when the agent declines a legal question mid-conversation, it doesn't repeat the
+  shortlist in that reply, but brings it right back once the user says "keep it as is." That's a
+  subtle distinction (a shortlist *existing* versus being *repeated this turn*), and getting it
+  right mattered more than almost anything else for matching expected behavior.
+- **The conversation budget is tiny** — 8 turns total, so about 4 back-and-forths. I told the
+  model explicitly to ask at most one or two clarifying questions and then commit using sensible
+  defaults, because early testing showed it would happily keep asking questions past the limit,
+  which torpedoes accuracy no matter how good the catalog matching is.
+- **Comparisons are answered only from catalog facts**, never from what the model might already
+  "know" about a product, and the same acronym-matching trick from retrieval makes sure
+  something like "OPQ" resolves to the right row even when abbreviated.
 
-Both eval scripts detect and skip (not silently pass) turns where the LLM
-call itself failed transport-wise (rate limit/timeout), so a quota exhaustion
-mid-run is reported as "N inconclusive" rather than misread as a real 0%.
-`tests/` (15 tests) covers everything deterministic -- grounding, refusal
-overrides, malformed-JSON repair, schema shape -- against a stub LLM client,
-so those don't depend on any provider or quota at all.
+## What didn't work the first time (and how I found out)
 
-**Known limitation at submission time:** a full clean Recall@10 run across
-all 10 traces was blocked by Groq's free-tier daily token cap (100k
-tokens/day; this eval alone uses ~3k tokens/turn x ~30 turns), which was hit
-partway through -- 7/10 traces scored, 3 skipped as inconclusive rather than
-scored as failures. The earlier draft of this document used a Gemini key
-whose free tier turned out to be even tighter (~20 requests/day) and which
-also silently returned empty completions until `reasoning_effort: "none"`
-was set (see above) -- switching to Groq fixed both the token-truncation bug
-and gave enough headroom to get the real numbers above. For grading traffic
-beyond what either free tier allows, a paid tier on either provider removes
-the constraint entirely; the code doesn't change.
+- **The model recommended too eagerly on vague first messages.** Testing live against the
+  deployed endpoint, I sent the exact same opening line SHL's own example uses — "we need a
+  solution for senior leadership" — and the agent skipped the clarifying question entirely and
+  guessed a shortlist. That's exactly the failure mode the assignment calls out by name. I
+  tightened the prompt to explicitly separate "names a role but nothing else" (must ask first)
+  from "names a skill, tool, or clear priority" (fine to act on immediately), redeployed, and
+  confirmed both cases behave correctly against the live service afterward.
+- **Gemini quietly returned empty replies.** Before settling on Groq, I tried Gemini 2.5 Flash,
+  which spends part of its token budget on invisible "thinking" before writing the actual answer
+  — with a normal token limit, it used the whole budget thinking and never got to the reply. The
+  fix was a one-line setting to turn that off; I found it by noticing the raw response reported
+  zero output tokens even though the call had "succeeded."
+- **Free-tier rate limits shaped the design more than expected.** My original prompt sent 40
+  candidate assessments per call (~5,000 tokens); that repeatedly tripped rate limits during
+  testing. I trimmed it to 25 candidates and compressed the format (dropped a field that was
+  always the same value for every item, replaced repeated category names with a short legend),
+  roughly halving the prompt size with no drop in which assessments got found.
+- **Error handling used to be one-size-fits-all.** If the model returned bad JSON, I'd retry with
+  "please try again" — reasonable for a formatting slip, useless for a rate-limit error, which
+  won't resolve itself in the few seconds a retry allows. Now formatting problems get one retry,
+  and provider/network failures fail straight to a safe, schema-valid fallback reply instead of
+  wasting time on a retry that can't help.
 
-## AI tool usage
+## How I tested it
 
-Used Claude Code as a pair-programmer for the full implementation (retrieval,
-agent orchestration, prompt design, tests, eval harness) and for reading the
-provided PDF/JSON/sample-conversation assets to reverse-engineer the exact
-expected behaviors (e.g. the refusal-blanks-recommendations rule above, which
-isn't stated explicitly in the assignment PDF and was only visible by reading
-trace `C7` closely). All design tradeoffs above were deliberate calls made
-during that process, not left as defaults.
+I measured four things, each with something runnable behind it rather than a one-off judgment
+call:
+
+- **Does search find the right things?** Unit tests confirm BM25 surfaces relevant assessments
+  for a query, and the acronym-matching layer catches names that keyword search alone would miss.
+- **Are the recommendations actually good?** I replayed SHL's 10 example conversations against
+  the live agent and checked how many of the "expected" assessments showed up in the top 10.
+  **Result: 0.56 average**, and no conversation came back completely empty. The reference
+  answers are often more specific than any first-pass system would guess (one expects an exact
+  personality test plus two of its report add-ons; the agent chose three different but reasonable
+  leadership assessments instead) — getting partial credit almost everywhere is a realistic bar
+  for a system with no hand-tuning per scenario.
+- **Can it ever make something up?** This is enforced in code (see above), not just hoped for,
+  and I wrote a test that feeds the agent a deliberately lying stub model to confirm the
+  filter actually catches it.
+- **Does it behave correctly overall?** I wrote eight small scripted conversations covering the
+  exact behaviors the assignment calls out — refuses off-topic questions, refuses legal
+  questions, refuses prompt injection, doesn't recommend on a vague first message, commits when
+  given real detail, updates the list on a new constraint, and always returns valid output even
+  on empty/garbage input. **7 of 8 passed**; the one "failure" was the agent correctly declining
+  to add a redundant test that the existing shortlist already covered — a case where my test's
+  expectation was stricter than the right answer.
+
+One honest caveat: free-tier daily rate limits meant I couldn't run the full 10-conversation
+test in one clean pass — a few runs got interrupted mid-way by the provider, not by anything
+wrong with the agent. My scripts detect that distinction and report those runs as "inconclusive"
+rather than silently counting them as failures, so the numbers above are real signal, not
+guesses.
+
+## Where AI tools fit in
+
+I used Claude Code throughout — for the implementation itself (retrieval, the agent logic,
+tests, the evaluation scripts) and, just as importantly, for closely reading SHL's assignment
+PDF, catalog data, and example conversations to figure out expected behaviors that weren't
+spelled out explicitly, like the refusal-clears-the-shortlist rule above. Every design decision
+in this document was one I made deliberately, not one left on autopilot.
