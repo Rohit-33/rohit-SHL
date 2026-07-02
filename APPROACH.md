@@ -112,8 +112,10 @@ failures, so the numbers above reflect real results, not guesses.
 
 ## AI tools used
 
-I used Claude Code throughout this project, both to write the code (search, agent logic, tests,
-evaluation scripts) and to carefully read SHL's assignment document, catalog data, and sample
-conversations to figure out expected behaviors that weren't written down explicitly, like the
-rule about clearing the shortlist during a refusal. Every choice described above was a decision
+Yes. I used an AI coding assistant throughout this project, both to write the code (search,
+agent logic, tests, evaluation scripts) and to carefully read SHL's assignment document, catalog
+data, and sample conversations to figure out expected behaviors that weren't written down
+explicitly, like the rule about clearing the shortlist during a refusal. I also tested the
+deployed agent against multiple LLM providers (Gemini, then Groq's Llama 3.3) before settling on
+Groq for reliability, as described above. Every choice described in this document was a decision
 I made on purpose, not something left on default.
