@@ -1,130 +1,119 @@
-# SHL Assessment Recommender — Approach
+# SHL Assessment Recommender: Approach
 
-I built a chat-based API that turns a vague hiring need ("we need someone for a leadership
-role") into a grounded shortlist of real SHL assessments, asks a clarifying question when it
-doesn't have enough to go on, updates the shortlist as requirements change, and answers
-comparison questions using catalog facts instead of guesses.
+I built a chat API that turns a vague hiring need ("we need someone for a leadership role")
+into a shortlist of real SHL assessments. It asks a clarifying question when it doesn't know
+enough, updates the shortlist when requirements change, and answers comparison questions using
+real catalog facts instead of guessing.
 
-**At a glance:** 377-item SHL catalog · BM25 retrieval · Llama 3.3 70B (Groq) · Recall@10 = 0.56
-on real traces · 7/8 behavior checks passed live · 15/15 unit tests passing.
+**At a glance:** 377 assessments in the catalog. Search powered by BM25. Llama 3.3 70B (via
+Groq) as the LLM. Recall@10 of 0.56 on real test conversations. 7 out of 8 behavior checks
+passed live. All 15 unit tests passing.
 
-## How it's put together
+## How it works
 
-The service is a small, stateless FastAPI app with two endpoints, `/health` and `/chat`. Every
-`/chat` call does the same five things:
+The service is a small FastAPI app with two endpoints, `/health` and `/chat`. It doesn't
+remember past conversations itself; every request includes the full chat history so far. For
+each message, it does five things:
 
-1. Look at the whole conversation so far and turn it into a search query.
-2. Search the 377-item catalog for the ~25 most relevant assessments.
-3. Hand the LLM the conversation plus *only* those candidates, along with a system prompt
-   spelling out the rules (clarify, recommend, refine, compare, refuse, stay grounded).
-4. Get back a structured decision as JSON — not free text I have to guess-parse.
-5. **Check every recommended item against the real catalog before it's allowed out the door.**
+1. Reads the whole conversation and turns it into a search query.
+2. Searches the 377 assessments and picks the 25 most relevant ones.
+3. Sends the conversation, those 25 candidates, and a set of instructions to the LLM.
+4. Gets back a clear, structured answer (not plain text I'd have to interpret).
+5. Double checks every recommended assessment against the real catalog before sending it back.
 
-That last step is the most important one. The model never gets to write a product name or a
-URL directly — it can only point at an ID from the list I gave it, and if it ever points at an
-ID that isn't in that list, I quietly drop it. This means a made-up assessment or a broken link
-isn't just "unlikely," it's structurally impossible. I'd rather guarantee this in code than trust
-a prompt instruction, however well worded.
+That last step matters most. The LLM never gets to write a product name or link on its own. It
+can only point to an assessment from the list I gave it. If it ever points to something that
+isn't on that list, I quietly remove it. This makes a made up assessment or broken link
+impossible, not just unlikely.
 
-## Finding the right assessments (retrieval)
+## How it finds the right assessments
 
-377 assessments is a small catalog — small enough that a full vector database with embeddings
-felt like the wrong tool for the job. It adds weight and startup time for free hosting, without
-a real accuracy payoff at this scale. So I used **BM25**, a classic keyword-ranking algorithm,
-over each item's name, description, category, and job level, with product names weighted
-higher so an exact match always wins.
+With only 377 assessments, a heavy search system like a vector database felt unnecessary. It
+would slow down startup on free hosting without really improving accuracy at this size. Instead
+I used BM25, a well known keyword search method, matching against each assessment's name,
+description, category, and job level. Product names count extra, so an exact match always wins.
 
-BM25 alone has two blind spots: short acronyms like "OPQ" or "GSA" don't score well on raw
-word frequency, and if someone types an exact product name, it should always be found — no
-exceptions. I added a small second pass that catches both cases directly, so retrieval never
-misses the obvious answer just because the ranking math didn't favor it.
+Plain keyword search has two weak spots. Short names like "OPQ" or "GSA" don't score well, and
+if someone types an exact product name, it should always be found. I added a small extra step
+that catches both cases directly, so the search never misses an obvious answer.
 
-Retrieval's only job is to hand the LLM a good *shortlist of candidates* — it never decides the
-final answer itself. Picking which of those candidates actually make the cut, reasoning about
-coverage ("this role probably also needs a cognitive test"), and updating the list as the
-conversation evolves are all the LLM's job, working only from what retrieval gave it.
+The search step only builds a list of good candidates. It never picks the final answer. The LLM
+decides which of those candidates to actually recommend, whether to add something like a
+cognitive test by default, and how to update the list as the conversation continues.
 
-## How the agent thinks
+## How the agent makes decisions
 
-Each turn, the LLM returns one structured decision: its reply text, whether the request is even
-in scope, whether it's ready to commit to a shortlist, which catalog IDs to recommend, and
-whether the conversation is wrapped up. A few rules are enforced in code no matter what the
-model says, because I don't trust prompt instructions alone to hold up over many turns:
+On every turn, the LLM returns one structured answer: its reply text, whether the question is
+even something it should answer, whether it's ready to give a shortlist, which assessments to
+recommend, and whether the conversation is finished. A few rules are enforced directly in code,
+not just requested in the prompt, because prompts alone don't always hold up over a long
+conversation:
 
-- **A refusal always clears the shortlist for that turn** — even if one was already agreed on
-  earlier in the conversation. I found this by reading through SHL's own example conversations
-  closely: when the agent declines a legal question mid-conversation, it doesn't repeat the
-  shortlist in that reply, but brings it right back once the user says "keep it as is." That's a
-  subtle distinction (a shortlist *existing* versus being *repeated this turn*), and getting it
-  right mattered more than almost anything else for matching expected behavior.
-- **The conversation budget is tiny** — 8 turns total, so about 4 back-and-forths. I told the
-  model explicitly to ask at most one or two clarifying questions and then commit using sensible
-  defaults, because early testing showed it would happily keep asking questions past the limit,
-  which torpedoes accuracy no matter how good the catalog matching is.
-- **Comparisons are answered only from catalog facts**, never from what the model might already
-  "know" about a product, and the same acronym-matching trick from retrieval makes sure
-  something like "OPQ" resolves to the right row even when abbreviated.
+- If the agent declines to answer something (like a legal question), the shortlist is cleared
+  for that reply, even if one was agreed on earlier. I found this by reading SHL's own sample
+  conversations closely: after declining an off topic question, the agent brings the shortlist
+  back once the user confirms they still want it. Getting this timing right turned out to matter
+  a lot.
+- The conversation is capped at 8 turns total, so about 4 exchanges. The agent is told to ask at
+  most one or two clarifying questions, then commit to a shortlist using reasonable defaults.
+  Early testing showed it would otherwise keep asking questions past the limit, which hurt
+  accuracy no matter how good the search was.
+- Comparison questions are answered only using facts from the catalog, never from general
+  knowledge the model might already have about a product.
 
-## What didn't work the first time (and how I found out)
+## What didn't work at first
 
-- **The model recommended too eagerly on vague first messages.** Testing live against the
-  deployed endpoint, I sent the exact same opening line SHL's own example uses — "we need a
-  solution for senior leadership" — and the agent skipped the clarifying question entirely and
-  guessed a shortlist. That's exactly the failure mode the assignment calls out by name. I
-  tightened the prompt to explicitly separate "names a role but nothing else" (must ask first)
-  from "names a skill, tool, or clear priority" (fine to act on immediately), redeployed, and
-  confirmed both cases behave correctly against the live service afterward.
-- **Gemini quietly returned empty replies.** Before settling on Groq, I tried Gemini 2.5 Flash,
-  which spends part of its token budget on invisible "thinking" before writing the actual answer
-  — with a normal token limit, it used the whole budget thinking and never got to the reply. The
-  fix was a one-line setting to turn that off; I found it by noticing the raw response reported
-  zero output tokens even though the call had "succeeded."
-- **Free-tier rate limits shaped the design more than expected.** My original prompt sent 40
-  candidate assessments per call (~5,000 tokens); that repeatedly tripped rate limits during
-  testing. I trimmed it to 25 candidates and compressed the format (dropped a field that was
-  always the same value for every item, replaced repeated category names with a short legend),
-  roughly halving the prompt size with no drop in which assessments got found.
-- **Error handling used to be one-size-fits-all.** If the model returned bad JSON, I'd retry with
-  "please try again" — reasonable for a formatting slip, useless for a rate-limit error, which
-  won't resolve itself in the few seconds a retry allows. Now formatting problems get one retry,
-  and provider/network failures fail straight to a safe, schema-valid fallback reply instead of
-  wasting time on a retry that can't help.
+- **It recommended too quickly on vague messages.** I tested it live with the exact same opening
+  line from SHL's own example, "we need a solution for senior leadership." The agent skipped
+  the clarifying question and guessed a shortlist right away. I updated the instructions to
+  separate two cases: a message that only names a role (should ask first) versus one that names
+  a specific skill, tool, or clear priority (fine to act on immediately). After the fix, both
+  cases worked correctly.
+- **One LLM option quietly gave empty answers.** Before settling on Groq, I tried Google's
+  Gemini model. It spends part of its reply budget on invisible "thinking" text before writing
+  the real answer, so with a normal limit it used up the whole budget thinking and never wrote a
+  reply. A single setting change fixed this.
+- **Free usage limits shaped some design choices.** My first version sent 40 candidate
+  assessments to the LLM on every turn, which used a lot of tokens and quickly hit rate limits
+  during testing. I trimmed it to 25 candidates and shortened the format for each one, cutting
+  the size roughly in half with no drop in accuracy.
+- **Error handling treated every failure the same way at first.** If the LLM gave back badly
+  formatted text, I'd retry automatically. That helps with a formatting mistake, but not with a
+  rate limit error, which won't fix itself in time. Now formatting problems get one retry, and
+  connection or rate limit problems fail straight to a safe, valid response instead of wasting
+  time.
 
 ## How I tested it
 
-I measured four things, each with something runnable behind it rather than a one-off judgment
-call:
+I checked four things, each backed by a script or test rather than a guess:
 
-- **Does search find the right things?** Unit tests confirm BM25 surfaces relevant assessments
-  for a query, and the acronym-matching layer catches names that keyword search alone would miss.
-- **Are the recommendations actually good?** I replayed SHL's 10 example conversations against
-  the live agent and checked how many of the "expected" assessments showed up in the top 10.
-  **Result: 0.56 average**, and no conversation came back completely empty. The reference
-  answers are often more specific than any first-pass system would guess (one expects an exact
-  personality test plus two of its report add-ons; the agent chose three different but reasonable
-  leadership assessments instead) — getting partial credit almost everywhere is a realistic bar
-  for a system with no hand-tuning per scenario.
-- **Can it ever make something up?** This is enforced in code (see above), not just hoped for,
-  and I wrote a test that feeds the agent a deliberately lying stub model to confirm the
-  filter actually catches it.
-- **Does it behave correctly overall?** I wrote eight small scripted conversations covering the
-  exact behaviors the assignment calls out — refuses off-topic questions, refuses legal
-  questions, refuses prompt injection, doesn't recommend on a vague first message, commits when
-  given real detail, updates the list on a new constraint, and always returns valid output even
-  on empty/garbage input. **7 of 8 passed**; the one "failure" was the agent correctly declining
-  to add a redundant test that the existing shortlist already covered — a case where my test's
-  expectation was stricter than the right answer.
+- **Search quality.** Unit tests confirm the search finds relevant assessments for a query, and
+  correctly matches short names and exact product names.
+- **Recommendation quality.** I replayed SHL's 10 sample conversations and checked how many of
+  the expected assessments showed up in the results. Average score: **0.56 out of 1.0**, and no
+  conversation came back completely empty. SHL's expected answers are often more specific than
+  a first attempt would guess, so getting partial credit almost everywhere is a realistic result
+  for a system with no manual tuning per scenario.
+- **No made up answers.** This is guaranteed in the code itself, not just hoped for. A test
+  feeds the agent a fake response that tries to recommend something outside the list, and
+  confirms it gets blocked.
+- **Overall behavior.** I wrote 8 small test conversations covering exactly what the assignment
+  asks for: refusing off topic questions, refusing legal questions, refusing prompt injection
+  attempts, not recommending on a vague first message, committing when given real detail,
+  updating the list when a constraint changes, and always returning a valid response even on
+  empty input. **7 out of 8 passed.** The one exception was the agent correctly choosing not to
+  add a duplicate test that the shortlist already covered, which was a stricter expectation in
+  my test than the actual correct behavior.
 
-One honest caveat: free-tier daily rate limits meant I couldn't run the full 10-conversation
-test in one clean pass — a few runs got interrupted mid-way by the provider, not by anything
-wrong with the agent. My scripts detect that distinction and report those runs as "inconclusive"
-rather than silently counting them as failures, so the numbers above are real signal, not
-guesses.
+One honest note: daily usage limits meant I couldn't run the full 10 conversation test in a
+single clean pass. A few runs were interrupted by the provider itself, not by any mistake in the
+agent. The scripts detect this and mark those runs as inconclusive instead of counting them as
+failures, so the numbers above reflect real results, not guesses.
 
-## Where AI tools fit in
+## AI tools used
 
-I used Claude Code throughout — for the implementation itself (retrieval, the agent logic,
-tests, the evaluation scripts) and, just as importantly, for closely reading SHL's assignment
-PDF, catalog data, and example conversations to figure out expected behaviors that weren't
-spelled out explicitly, like the refusal-clears-the-shortlist rule above. Every design decision
-in this document was one I made deliberately, not one left on autopilot.
+I used Claude Code throughout this project, both to write the code (search, agent logic, tests,
+evaluation scripts) and to carefully read SHL's assignment document, catalog data, and sample
+conversations to figure out expected behaviors that weren't written down explicitly, like the
+rule about clearing the shortlist during a refusal. Every choice described above was a decision
+I made on purpose, not something left on default.
