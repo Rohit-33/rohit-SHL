@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: shl-assessment-recommender
+    runtime: docker
+    plan: free
+    envVars:
+      - key: LLM_API_KEY
+        sync: false
+      - key: LLM_BASE_URL
+        value: https://api.groq.com/openai/v1
+      - key: LLM_MODEL
+        value: llama-3.3-70b-versatile
+      - key: LLM_TIMEOUT_SECONDS
+        value: "20"
+    healthCheckPath: /health
